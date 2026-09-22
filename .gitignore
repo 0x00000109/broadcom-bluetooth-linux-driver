@@ -1,0 +1,14 @@
+.venv/
+ghidra/
+logs/
+*.pyc
+__pycache__/
+.DS_Store
+driver_src/*.o
+driver_src/*.ko
+driver_src/*.mod
+driver_src/*.mod.c
+driver_src/*.symvers
+driver_src/*.order
+driver_src/.*.cmd
+driver_src/.tmp_versions/
