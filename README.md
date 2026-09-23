@@ -1,6 +1,8 @@
-# Broadcom & Apple Bluetooth USB Linux Driver (Modern Kernels 6.x / 7+)
+# Universal Broadcom Bluetooth USB Linux Driver (Modern Kernels 6.x / 7+)
 
-An open-source universal Linux kernel driver and reverse-engineering repository for Broadcom Bluetooth USB controllers (including OEM integrations in Apple MacBooks, iMacs, and generic Broadcom / ASUS / Dell / HP M.2 / PCIe combo modules like BCM4352 / BCM4360).
+An open-source universal Linux kernel driver and reverse-engineering repository for Broadcom Bluetooth **USB controllers** (including OEM integrations in Apple MacBooks/iMacs and generic M.2/PCIe combo modules where Bluetooth USB lines are wired). 
+
+* Note: Pure Wi-Fi adapter cards (such as the ASUS PCE-AC56 based on BCM4352, which lack Bluetooth hardware or USB routing) do not utilize Bluetooth drivers.
 
 ## Repository Structure
 
