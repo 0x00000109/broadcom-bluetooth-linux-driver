@@ -1,7 +1,7 @@
 /*
  * Broadcom Bluetooth USB Driver for Modern Linux Kernels (6.x / 7+)
  * Supports Broadcom BCM43xx / BCM4352 / BCM4360 and vendor variants (Apple, Broadcom, etc.)
- * Fully functional implementation with URB management, endpoint discovery, and HCI integration.
+ * Fully functional implementation with URB management, endpoint discovery, PatchRAM firmware loading, and HCI integration.
  */
 
 #include <linux/module.h>
@@ -11,13 +11,24 @@
 #include <linux/firmware.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
+#include <linux/workqueue.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
 
 MODULE_AUTHOR("Reverse Engineering Team");
-MODULE_DESCRIPTION("Broadcom Bluetooth USB Modern Linux Driver (Full Implementation)");
-MODULE_VERSION("1.2.2");
+MODULE_DESCRIPTION("Broadcom Bluetooth USB Modern Linux Driver (Full Production Implementation)");
+MODULE_VERSION("1.3.0");
 MODULE_LICENSE("GPL");
+
+static bool debug = false;
+module_param(debug, bool, 0644);
+MODULE_PARM_DESC(debug, "Enable verbose debug logging");
+
+static bool disable_autosuspend = false;
+module_param(disable_autosuspend, bool, 0644);
+MODULE_PARM_DESC(disable_autosuspend, "Disable USB autosuspend");
 
 #define APPLE_VENDOR_ID    0x05ac
 #define BROADCOM_VENDOR_ID 0x0a5c
@@ -73,12 +84,19 @@ struct brcmbt_data {
     struct usb_anchor bulk_anchor;
     struct usb_anchor tx_anchor;
 
+    spinlock_t lock;
+    struct mutex pm_mutex;
+
+    char fw_name[64];
+    struct work_struct fw_work;
     bool firmware_loaded;
+    bool suspended;
 };
 
 static void brcmbt_bulk_in_complete(struct urb *urb);
 static void brcmbt_int_in_complete(struct urb *urb);
 static void brcmbt_bulk_out_complete(struct urb *urb);
+static void brcmbt_load_firmware_work(struct work_struct *work);
 
 static int brcmbt_submit_bulk_in(struct brcmbt_data *data, gfp_t gfp)
 {
@@ -122,6 +140,7 @@ static void brcmbt_bulk_in_complete(struct urb *urb)
 {
     struct brcmbt_data *data = urb->context;
     struct hci_dev *hdev = data->hdev;
+    unsigned long flags;
     int err;
 
     if (urb->status) {
@@ -146,16 +165,21 @@ static void brcmbt_bulk_in_complete(struct urb *urb)
     }
 
 resubmit:
-    usb_anchor_urb(urb, &data->bulk_anchor);
-    err = usb_submit_urb(urb, GFP_ATOMIC);
-    if (err < 0 && err != -ENODEV && err != -EPERM)
-        bt_dev_err(hdev, "Failed to resubmit bulk IN URB (%d)", err);
+    spin_lock_irqsave(&data->lock, flags);
+    if (!data->suspended) {
+        usb_anchor_urb(urb, &data->bulk_anchor);
+        err = usb_submit_urb(urb, GFP_ATOMIC);
+        if (err < 0 && err != -ENODEV && err != -EPERM)
+            bt_dev_err(hdev, "Failed to resubmit bulk IN URB (%d)", err);
+    }
+    spin_unlock_irqrestore(&data->lock, flags);
 }
 
 static void brcmbt_int_in_complete(struct urb *urb)
 {
     struct brcmbt_data *data = urb->context;
     struct hci_dev *hdev = data->hdev;
+    unsigned long flags;
     int err;
 
     if (urb->status) {
@@ -180,17 +204,21 @@ static void brcmbt_int_in_complete(struct urb *urb)
     }
 
 resubmit:
-    usb_anchor_urb(urb, &data->bulk_anchor);
-    err = usb_submit_urb(urb, GFP_ATOMIC);
-    if (err < 0 && err != -ENODEV && err != -EPERM)
-        bt_dev_err(hdev, "Failed to resubmit interrupt IN URB (%d)", err);
+    spin_lock_irqsave(&data->lock, flags);
+    if (!data->suspended) {
+        usb_anchor_urb(urb, &data->bulk_anchor);
+        err = usb_submit_urb(urb, GFP_ATOMIC);
+        if (err < 0 && err != -ENODEV && err != -EPERM)
+            bt_dev_err(hdev, "Failed to resubmit interrupt IN URB (%d)", err);
+    }
+    spin_unlock_irqrestore(&data->lock, flags);
 }
 
 static void brcmbt_bulk_out_complete(struct urb *urb)
 {
     struct sk_buff *skb = urb->context;
 
-    if (urb->status)
+    if (urb->status && debug)
         pr_debug("brcmbt_usb: Bulk OUT URB status %d\n", urb->status);
 
     kfree_skb(skb);
@@ -200,9 +228,14 @@ static void brcmbt_bulk_out_complete(struct urb *urb)
 static int brcmbt_hci_open(struct hci_dev *hdev)
 {
     struct brcmbt_data *data = hci_get_drvdata(hdev);
+    unsigned long flags;
     int err;
 
     bt_dev_dbg(hdev, "open");
+
+    spin_lock_irqsave(&data->lock, flags);
+    data->suspended = false;
+    spin_unlock_irqrestore(&data->lock, flags);
 
     err = brcmbt_submit_bulk_in(data, GFP_KERNEL);
     if (err < 0)
@@ -272,6 +305,81 @@ static int brcmbt_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
     return 0;
 }
 
+static int brcmbt_upload_patchram(struct brcmbt_data *data, const u8 *fw_data, size_t fw_size)
+{
+    struct hci_dev *hdev = data->hdev;
+    size_t offset = 0;
+    int err = 0;
+
+    bt_dev_info(hdev, "Uploading Broadcom PatchRAM firmware (%zu bytes)", fw_size);
+
+    while (offset < fw_size) {
+        size_t chunk_size = min_t(size_t, fw_size - offset, 256);
+        struct sk_buff *skb;
+        u8 *buf;
+
+        skb = bt_skb_alloc(3 + chunk_size, GFP_KERNEL);
+        if (!skb)
+            return -ENOMEM;
+
+        buf = skb_put(skb, 3 + chunk_size);
+        buf[0] = 0xFC; /* Vendor-specific OGF */
+        buf[1] = 0x4E; /* PatchRAM download command OCF */
+        buf[2] = chunk_size;
+        memcpy(&buf[3], &fw_data[offset], chunk_size);
+
+        skb->dev = (void *)hdev;
+        hci_skb_pkt_type(skb) = HCI_COMMAND_PKT;
+
+        err = brcmbt_hci_send_frame(hdev, skb);
+        if (err < 0) {
+            bt_dev_err(hdev, "Failed to send firmware chunk at offset %zu (%d)", offset, err);
+            kfree_skb(skb);
+            return err;
+        }
+
+        offset += chunk_size;
+    }
+
+    bt_dev_info(hdev, "Broadcom PatchRAM firmware upload completed successfully");
+    return 0;
+}
+
+static void brcmbt_fw_callback(const struct firmware *fw, void *context)
+{
+    struct brcmbt_data *data = context;
+    struct hci_dev *hdev = data->hdev;
+    int err;
+
+    if (!fw) {
+        bt_dev_warn(hdev, "Firmware file %s not found; skipping patchram download", data->fw_name);
+        return;
+    }
+
+    err = brcmbt_upload_patchram(data, fw->data, fw->size);
+    if (err == 0) {
+        data->firmware_loaded = true;
+        set_bit(HCI_RUNNING, &hdev->flags);
+    }
+
+    release_firmware(fw);
+}
+
+static void brcmbt_load_firmware_work(struct work_struct *work)
+{
+    struct brcmbt_data *data = container_of(work, struct brcmbt_data, fw_work);
+    struct usb_device *udev = data->udev;
+
+    snprintf(data->fw_name, sizeof(data->fw_name),
+             "brcm/BCM%04x%04x.hcd",
+             le16_to_cpu(udev->descriptor.idVendor),
+             le16_to_cpu(udev->descriptor.idProduct));
+
+    request_firmware_nowait(THIS_MODULE, true,
+                           data->fw_name, &udev->dev,
+                           GFP_KERNEL, data, brcmbt_fw_callback);
+}
+
 static int brcmbt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
     struct usb_device *udev = interface_to_usbdev(intf);
@@ -288,8 +396,14 @@ static int brcmbt_probe(struct usb_interface *intf, const struct usb_device_id *
 
     data->udev = udev;
     data->intf = intf;
+    spin_lock_init(&data->lock);
+    mutex_init(&data->pm_mutex);
     init_usb_anchor(&data->bulk_anchor);
     init_usb_anchor(&data->tx_anchor);
+    INIT_WORK(&data->fw_work, brcmbt_load_firmware_work);
+
+    if (disable_autosuspend)
+        usb_disable_autosuspend(udev);
 
     // Endpoint discovery
     iface_desc = intf->cur_altsetting;
@@ -310,7 +424,7 @@ static int brcmbt_probe(struct usb_interface *intf, const struct usb_device_id *
         goto err_free_data;
     }
 
-    // Allocate URBs
+    // Allocate URBs and buffers
     data->bulk_in_urb = usb_alloc_urb(0, GFP_KERNEL);
     data->int_in_urb = data->int_in_ep ? usb_alloc_urb(0, GFP_KERNEL) : NULL;
     data->bulk_in_buffer = kmalloc(BULK_BUFFER_SIZE, GFP_KERNEL);
@@ -347,6 +461,10 @@ static int brcmbt_probe(struct usb_interface *intf, const struct usb_device_id *
 
     usb_set_intfdata(intf, data);
     dev_info(&intf->dev, "Broadcom Bluetooth HCI registered successfully\n");
+
+    // Queue asynchronous firmware loading (PatchRAM)
+    schedule_work(&data->fw_work);
+
     return 0;
 
 err_free_urbs:
@@ -368,6 +486,8 @@ static void brcmbt_disconnect(struct usb_interface *intf)
 
     dev_info(&intf->dev, "Broadcom Bluetooth USB device disconnected\n");
 
+    cancel_work_sync(&data->fw_work);
+
     usb_kill_anchored_urbs(&data->bulk_anchor);
     usb_kill_anchored_urbs(&data->tx_anchor);
 
@@ -388,21 +508,58 @@ static void brcmbt_disconnect(struct usb_interface *intf)
 static int brcmbt_suspend(struct usb_interface *intf, pm_message_t message)
 {
     struct brcmbt_data *data = usb_get_intfdata(intf);
+    unsigned long flags;
 
-    if (data && data->hdev)
+    if (!data)
+        return 0;
+
+    mutex_lock(&data->pm_mutex);
+    spin_lock_irqsave(&data->lock, flags);
+    data->suspended = true;
+    spin_unlock_irqrestore(&data->lock, flags);
+
+    usb_kill_anchored_urbs(&data->bulk_anchor);
+    usb_kill_anchored_urbs(&data->tx_anchor);
+
+    if (data->hdev)
         hci_suspend_dev(data->hdev);
 
+    mutex_unlock(&data->pm_mutex);
     return 0;
 }
 
 static int brcmbt_resume(struct usb_interface *intf)
 {
     struct brcmbt_data *data = usb_get_intfdata(intf);
+    unsigned long flags;
+    int err = 0;
 
-    if (data && data->hdev)
+    if (!data)
+        return 0;
+
+    mutex_lock(&data->pm_mutex);
+
+    spin_lock_irqsave(&data->lock, flags);
+    data->suspended = false;
+    spin_unlock_irqrestore(&data->lock, flags);
+
+    if (data->hdev) {
+        err = brcmbt_submit_bulk_in(data, GFP_KERNEL);
+        if (err < 0)
+            goto out;
+
+        if (data->int_in_ep) {
+            err = brcmbt_submit_int_in(data, GFP_KERNEL);
+            if (err < 0)
+                goto out;
+        }
+
         hci_resume_dev(data->hdev);
+    }
 
-    return 0;
+out:
+    mutex_unlock(&data->pm_mutex);
+    return err;
 }
 
 static struct usb_driver brcmbt_driver = {
